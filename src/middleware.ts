@@ -10,21 +10,24 @@ const sellerAccount = await getOrCreateSellerAccount();
 export const x402Middleware = paymentMiddleware(
   sellerAccount.address,
   {
-    // pages
-    "/blog": {
-      price: "$0.001",
+    "/api/fetch": {
+      price: "$4.04",
       network,
       config: {
-        description: "Access to protected content",
+        description: "Buy 10,000 X404 tokens",
+        outputSchema: { type: "string" },
       },
     },
-    // api routes
+
     "/api/add": {
       price: "$0.005",
       network,
-      config: {
-        description: "Access to protected content",
-      },
+      config: { description: "Access to protected content" },
+    },
+    "/blog": {
+      price: "$0.001",
+      network,
+      config: { description: "Access to protected content" },
     },
   },
   facilitator
