@@ -5,6 +5,19 @@ export const runtime = "nodejs";
 import { NextRequest, NextResponse } from "next/server";
 import { CdpClient } from "@coinbase/cdp-sdk";
 import { parseUnits } from "viem/utils";
+// 仍然保留 export const runtime = "nodejs";
+import { NextResponse } from "next/server";
+
+export async function GET() {
+  return NextResponse.json({
+    ok: true,
+    message: "Use POST with header x-admin-token to withdraw.",
+    example: {
+      curl: 'curl -X POST https://你的域名.vercel.app/api/admin/withdraw -H "content-type: application/json" -H "x-admin-token: <ADMIN_TOKEN>" -d \'{"to":"0x...","amount":"10","asset":"USDC"}\''
+    }
+  });
+}
+
 
 // Base 主网 USDC 合约（6位小数）
 const USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54b268c0e6";
