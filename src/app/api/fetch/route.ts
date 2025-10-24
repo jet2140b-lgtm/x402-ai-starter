@@ -1,29 +1,28 @@
 // src/app/api/fetch/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { Coinbase } from "@coinbase/cdp-sdk";
+import { CdpClient } from "@coinbase/cdp-sdk";
 import { parseUnits } from "viem/utils";
 
-function getPayer(req: NextRequest): string {
+function readPayer(req: NextRequest) {
   const b64 =
     req.headers.get("x-payment-response") ||
     req.headers.get("x-402-receipt") ||
     "";
-  try {
-    if (b64) {
+  if (b64) {
+    try {
       const j = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
       return j.payer || j.account || j.from || "";
-    }
-  } catch {}
+    } catch {}
+  }
   return new URL(req.url).searchParams.get("to") || "";
 }
 
 export async function GET(req: NextRequest) {
-  const to = getPayer(req);
-  if (!to) {
-    return NextResponse.json({ error: "Missing payer address" }, { status: 400 });
-  }
+  const to = readPayer(req);
+  if (!to)
+    return NextResponse.json({ error: "Missing payer" }, { status: 400 });
 
-  const cdp = new Coinbase({
+  const cdp = new CdpClient({
     apiKeyName: process.env.CDP_API_KEY_ID!,
     apiKeySecret: process.env.CDP_API_KEY_SECRET!,
     walletSecret: process.env.CDP_WALLET_SECRET!,
@@ -31,10 +30,17 @@ export async function GET(req: NextRequest) {
 
   const token = process.env.X404_CONTRACT_ADDRESS!;
   const decimals = Number(process.env.X404_DECIMALS || "18");
-  const perFetch = process.env.X404_PER_FETCH || "10000";
-  const amount = parseUnits(perFetch, decimals);
+  const amount = parseUnits(process.env.X404_PER_FETCH || "10000", decimals);
 
-  await cdp.transfers.sendErc20({ tokenAddress: token, to, amount });
+  await cdp.transfers.sendErc20({
+    tokenAddress: token,
+    to,
+    amount,
+  });
 
-  return NextResponse.json({ ok: true, to, sent: perFetch });
+  return NextResponse.json({
+    ok: true,
+    sent: process.env.X404_PER_FETCH || "10000",
+    to,
+  });
 }
