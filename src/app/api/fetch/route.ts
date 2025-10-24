@@ -1,6 +1,6 @@
 // src/app/api/fetch/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@coinbase/cdp-sdk";
+import { Coinbase } from "@coinbase/cdp-sdk";
 import { parseUnits } from "viem/utils";
 
 function getPayer(req: NextRequest): string {
@@ -23,9 +23,9 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Missing payer address" }, { status: 400 });
   }
 
-  const cdp = createClient({
+  const cdp = new Coinbase({
     apiKeyName: process.env.CDP_API_KEY_ID!,
-    privateKey: process.env.CDP_API_KEY_SECRET!,
+    apiKeySecret: process.env.CDP_API_KEY_SECRET!,
     walletSecret: process.env.CDP_WALLET_SECRET!,
   });
 
