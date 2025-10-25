@@ -1,4 +1,3 @@
-// src/app/api/admin/deploy-smart-account/route.ts
 export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
@@ -27,18 +26,26 @@ export async function GET(req: NextRequest) {
       privateKey: process.env.CDP_API_KEY_PRIVATE_KEY!,
     });
 
-    // 🔧 强制构造一个“SmartAccount 对象”，至少包含 address 字段
-    const sa = { address } as any;
+    // ✅ 明确指定 owner 对象（用于 Smart Account）
+    const owner = { address: process.env.SELLER_ADDRESS || address };
+    const sa = { address, owner };
 
-    // 发一笔 0 ETH 自转，触发部署
+    // ✅ 调用 sendUserOperation，注意 calls 格式
     const sendRes = await cdp.evm.sendUserOperation({
-      smartAccount: sa,               // ✅ 必须传对象（当前 SDK 分支会访问 .address）
+      smartAccount: sa,
       network,
-      calls: [{ to: address as `0x${string}`, value: parseEther("0"), data: "0x" }],
+      calls: [
+        {
+          to: address as `0x${string}`,
+          value: parseEther("0"),
+          data: "0x", // 必须显式 "0x"
+        },
+      ],
     });
 
+    // ✅ 等待确认
     const receipt = await cdp.evm.waitForUserOperation({
-      smartAccount: sa,               // ✅ 等待同样传对象
+      smartAccount: sa,
       userOpHash: sendRes.userOpHash,
     });
 
@@ -47,16 +54,17 @@ export async function GET(req: NextRequest) {
       deployed: receipt?.status === "complete",
       smartAccount: address,
       userOpHash: sendRes.userOpHash,
-      hint: receipt?.status === "complete"
-        ? "Smart Account 已部署。"
-        : "已提交 UO，稍后再查。",
+      hint:
+        receipt?.status === "complete"
+          ? "✅ Smart Account 已成功部署"
+          : "已提交 UO，请稍后刷新 Portal 查看。",
     });
   } catch (err: any) {
     return ok({
       ok: false,
       smartAccount: address,
       error: String(err),
-      tip: "已把 smartAccount 强制传对象。如果仍失败，请把完整错误返回给我。",
-    }, 200);
+      tip: "已添加 owner 和 data 字段。如果仍失败，请保留完整 JSON 报错发给我。",
+    });
   }
 }
