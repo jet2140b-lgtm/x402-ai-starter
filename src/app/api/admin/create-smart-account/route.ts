@@ -2,105 +2,83 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { CdpClient } from "@coinbase/cdp-sdk";
+import { parseEther } from "viem";
 
-const ok = (data: any, status = 200) => NextResponse.json(data, { status });
+const ok = (d: any, s = 200) => NextResponse.json(d, { status: s });
 const noauth = () => ok({ ok: false, error: "unauthorized" }, 401);
 
-// 列出 Smart Accounts（兼容多版本命名）
-async function listSmart(cdp: any) {
-  const evm = cdp.evm;
-  if (!evm) return { list: [], used: "none" };
-  try {
-    if (evm.smartWallets?.listAccounts) {
-      return { list: await evm.smartWallets.listAccounts(), used: "evm.smartWallets.listAccounts" };
-    }
-  } catch {}
-  try {
-    if (evm.listSmartAccounts) {
-      return { list: await evm.listSmartAccounts(), used: "evm.listSmartAccounts" };
-    }
-  } catch {}
-  try {
-    if (evm.accounts?.listSmartAccounts) {
-      return { list: await evm.accounts.listSmartAccounts(), used: "evm.accounts.listSmartAccounts" };
-    }
-  } catch {}
-  return { list: [], used: "none" };
-}
-
-// 创建 EOA（作为 owner，兼容多版本命名）
-async function createEOA(cdp: any) {
-  const evm = cdp.evm;
-  if (evm?.createAccount) return await evm.createAccount();
-  if (evm?.accounts?.create) return await evm.accounts.create();
-  throw new Error("No EOA creator found (evm.createAccount / evm.accounts.create).");
-}
-
-// 创建 Smart Account（兼容多版本 & 参数名）
-async function createSmart(cdp: any, ownerId?: string, ownerAddress?: string) {
-  const evm = cdp.evm;
-  const arg = ownerId ? { ownerAccountId: ownerId } : { ownerAddress };
-
-  if (evm?.smartWallets?.createAccount) return await evm.smartWallets.createAccount(arg);
-  if (evm?.createSmartAccount) return await evm.createSmartAccount(arg);
-  if (evm?.accounts?.createSmartAccount) return await evm.accounts.createSmartAccount(arg);
-
-  throw new Error("No Smart Account creator found.");
-}
-
-function extractAddressId(x: any) {
-  return {
-    address: x?.address ?? x?.smartAccount?.address ?? x?.data?.address ?? x?.result?.address ?? null,
-    id: x?.id ?? x?.smartAccount?.id ?? x?.data?.id ?? x?.result?.id ?? null,
-  };
-}
-
+/**
+ * 访问方式：
+ *   GET /api/admin/create-smart-account?token=<ADMIN_TOKEN>
+ *
+ * 流程：
+ *   1) 创建一个 EVM EOA 账户（Owner）
+ *   2) 用 owner 对象创建 Smart Account（仅生成 CREATE2 地址）
+ *   3) 发送一笔 “0 ETH 自转” 的 User Operation 在 Base 主网，让 Smart Account 真正部署
+ *      —— 若你还没做 Gas 赞助，请先往 Smart Account 地址转入少量 Base ETH（~0.002）
+ */
 export async function GET(req: NextRequest) {
-  const token = req.headers.get("x-admin-token") ?? new URL(req.url).searchParams.get("token");
+  const token =
+    req.headers.get("x-admin-token") ??
+    new URL(req.url).searchParams.get("token");
   if (token !== process.env.ADMIN_TOKEN) return noauth();
 
   try {
-    const cdp: any = new CdpClient({
+    const network = process.env.NETWORK || "base-mainnet"; // 和你线上一致
+    const cdp = new CdpClient({
       apiKeyName: process.env.CDP_API_KEY_NAME!,
       privateKey: process.env.CDP_API_KEY_PRIVATE_KEY!,
     });
 
-    // 1) 列旧列表
-    const before = await listSmart(cdp);
+    // 1) 创建 Owner（EVM EOA）
+    const owner = await cdp.evm.createAccount(); // 文档示例就是这样
+    // 2) 基于 Owner 创建 Smart Account（先拿到 CREATE2 地址，但尚未部署）
+    const smartAccount = await cdp.evm.createSmartAccount({ owner });
 
-    // 2) 准备 owner
-    let ownerId = process.env.CDP_OWNER_EOA_ID;
-    let ownerAddress = process.env.CDP_OWNER_EOA_ADDRESS;
-    if (!ownerId && !ownerAddress) {
-      const eoa = await createEOA(cdp);
-      ownerId = eoa?.id;
-      ownerAddress = eoa?.address;
+    // === 重要：部署 Smart Account（第一次 UO）===
+    // 官方说明：主网需要资金或开启 Gas Sponsorship。否则这一步会因 gas 不足而失败。:contentReference[oaicite:2]{index=2}
+    // 这里我们发一笔 0 ETH 到 owner 自己的“空调用”，只为触发部署。
+    let userOpHash: string | undefined;
+    try {
+      const sendRes = await cdp.evm.sendUserOperation({
+        smartAccount,            // 直接传对象，不是地址
+        network,                 // base-mainnet / base-sepolia
+        calls: [
+          { to: owner.address, value: parseEther("0"), data: "0x" }
+        ],
+      });
+      userOpHash = sendRes.userOpHash;
+
+      // 等待 UO 上链完成（部署完成）
+      const receipt = await cdp.evm.waitForUserOperation({
+        smartAccountAddress: smartAccount.address,
+        userOpHash,
+      });
+
+      return ok({
+        ok: true,
+        owner: { address: owner.address },
+        smartAccount: { address: smartAccount.address },
+        deployed: receipt.status === "complete",
+        userOpHash,
+        hint:
+          receipt.status === "complete"
+            ? "Smart Account 已部署，可在 Dashboard 的 Smart account 栏看到。"
+            : "已提交 UO，稍后再刷新 Dashboard。",
+      });
+    } catch (deployErr: any) {
+      // 多半是没 gas（Base 主网）或未开启 Paymaster/Gas Sponsorship
+      return ok({
+        ok: true,
+        owner: { address: owner.address },
+        smartAccount: { address: smartAccount.address },
+        deployed: false,
+        userOpError: String(deployErr),
+        next:
+          "请先向上面的 smartAccount.address 转入少量 Base ETH（~0.002），或在 CDP 配置 Gas Sponsorship，然后再调用本接口一次以完成部署。",
+      }, 200);
     }
-
-    // 3) 创建
-    const raw = await createSmart(cdp, ownerId, ownerAddress);
-    const fromRaw = extractAddressId(raw);
-
-    // 4) 列新列表，取差集
-    const after = await listSmart(cdp);
-    const setBefore = new Set((before.list || []).map((i: any) => (extractAddressId(i).address || "").toLowerCase()));
-    const added = (after.list || []).map(extractAddressId).filter((i: any) => i.address && !setBefore.has(i.address.toLowerCase()));
-
-    const final = added[0] || fromRaw;
-
-    return ok({
-      ok: !!final.address,
-      address: final.address,
-      id: final.id,
-      used: { listBefore: before.used, listAfter: after.used },
-      ownerId,
-      ownerAddress,
-      raw, // 返回原始创建响应，便于诊断
-      hint:
-        "若 address 仍为 null，请把响应里的 raw 发我。你也可以先打开 /api/admin/cdp-debug 看看 SDK 可用方法。",
-    });
   } catch (err: any) {
-    console.error(err);
     return ok({ ok: false, error: String(err) }, 500);
   }
 }
