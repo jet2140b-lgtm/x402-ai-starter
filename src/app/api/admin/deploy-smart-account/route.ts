@@ -36,60 +36,67 @@ export async function GET(req: NextRequest) {
       privateKey: process.env.CDP_API_KEY_PRIVATE_KEY!,
     });
 
-    // 1) 先创建 smartAccount 对象（带 owner）
-    const smartAccount = { address, owner: { address: ownerAddress } } as any;
+    // 1) 尝试从 SDK 取“真对象”：有些版本必须用 getSmartAccount 得到可用对象
+    let sa: any = null;
+    if (cdp?.evm?.getSmartAccount) {
+      try {
+        sa = await cdp.evm.getSmartAccount({ address, network });
+      } catch {
+        sa = await cdp.evm.getSmartAccount({ address });
+      }
+    }
+    // 若取不到，就退化为最小对象
+    if (!sa) sa = { address, owner: { address: ownerAddress } };
 
-    // 2) 优先使用对象自身的方法（很多版本要求这样）
-    const hasObjSend = typeof smartAccount.sendUserOperation === "function";
-    const hasObjWait = typeof smartAccount.waitForUserOperation === "function";
+    const hasObjSend = typeof sa.sendUserOperation === "function";
+    const hasObjWait = typeof sa.waitForUserOperation === "function";
+    const hasCdpSend = typeof cdp?.evm?.sendUserOperation === "function";
+    const hasCdpWait = typeof cdp?.evm?.waitForUserOperation === "function";
 
-    // 3) 准备 calls（全部用字符串，避免 bigint/类型不匹配）
-    const calls = [
-      {
-        to: ownerAddress as `0x${string}`,
-        value: "0",            // ✅ 字符串 "0"，避免 bigint
-        data: "0x",            // ✅ 必须显式 "0x"
-      },
-    ];
+    // 2) calls：改用十六进制 "0x0" 避免类型校验差异；data 显式 "0x"
+    const calls = [{ to: ownerAddress as `0x${string}`, value: "0x0", data: "0x" }];
 
-    // 为了排错，先返回可见的关键形状
-    const debug = {
-      methodUsed: hasObjSend ? "smartAccount.sendUserOperation" : "cdp.evm.sendUserOperation",
-      network,
-      hasObjWait,
-      callsShape: Array.isArray(calls) ? "array" : typeof calls,
-      callsLen: (calls as any)?.length ?? null,
-    };
-
-    // 4) 发送 UO
+    // 3) 发送 UO（优先对象方法，其次 cdp.evm）
     let userOpHash: string | undefined;
+    let methodUsed = "";
     if (hasObjSend) {
-      // 某些版本：对象方法只要 { network, calls }
-      const res = await smartAccount.sendUserOperation({ network, calls });
+      methodUsed = "smartAccount.sendUserOperation";
+      const res = await sa.sendUserOperation({ network, calls });
+      userOpHash = res?.userOpHash;
+    } else if (hasCdpSend) {
+      methodUsed = "cdp.evm.sendUserOperation";
+      const res = await cdp.evm.sendUserOperation({ smartAccount: sa, network, calls });
       userOpHash = res?.userOpHash;
     } else {
-      // 兜底：走 cdp.evm 版本，但仍传 smartAccount 对象（不是 address）
-      const res = await cdp.evm.sendUserOperation({ smartAccount, network, calls });
-      userOpHash = res?.userOpHash;
+      return ok({
+        ok: false,
+        error: "No sendUserOperation available on smartAccount or cdp.evm",
+        debug: { hasObjSend, hasCdpSend, hasObjWait, hasCdpWait, network, callsLen: calls.length },
+      });
     }
 
     if (!userOpHash) {
       return ok({
         ok: false,
-        smartAccount: address,
-        owner: ownerAddress,
-        network,
         error: "userOpHash missing after sendUserOperation",
-        debug,
+        debug: { methodUsed, network, callsLen: calls.length },
       });
     }
 
-    // 5) 等待完成
+    // 4) 等待（优先对象 wait，其次 cdp.evm）
     let receipt: any;
     if (hasObjWait) {
-      receipt = await smartAccount.waitForUserOperation({ userOpHash });
+      methodUsed += " + smartAccount.waitForUserOperation";
+      receipt = await sa.waitForUserOperation({ userOpHash });
+    } else if (hasCdpWait) {
+      methodUsed += " + cdp.evm.waitForUserOperation";
+      receipt = await cdp.evm.waitForUserOperation({ smartAccount: sa, userOpHash });
     } else {
-      receipt = await cdp.evm.waitForUserOperation({ smartAccount, userOpHash });
+      return ok({
+        ok: false,
+        error: "No waitForUserOperation available",
+        debug: { methodUsed, hasObjWait, hasCdpWait },
+      });
     }
 
     return ok({
@@ -99,10 +106,9 @@ export async function GET(req: NextRequest) {
       owner: ownerAddress,
       network,
       userOpHash,
-      // debug, // 若还失败可临时打开返回 debug
+      debug: { methodUsed }, // 如需，可删除
     });
   } catch (err: any) {
-    // 返回字符串化的错误
     return ok({
       ok: false,
       smartAccount: address,
