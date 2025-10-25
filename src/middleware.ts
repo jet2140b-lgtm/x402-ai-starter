@@ -11,10 +11,10 @@ export const x402Middleware = paymentMiddleware(
   sellerAccount.address,
   {
     "/api/fetch": {
-      price: "$4.04",
+      price: "$0.404",
       network,
       config: {
-        description: "Buy 10,000 X404 tokens",
+        description: "Buy 5,000 X404 tokens",
         outputSchema: { type: "string" },
       },
     },
