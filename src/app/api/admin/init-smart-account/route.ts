@@ -4,17 +4,30 @@ import { NextRequest, NextResponse } from "next/server";
 import { CdpClient } from "@coinbase/cdp-sdk";
 import { parseEther } from "viem";
 
-const ok = (d: any, s = 200) => NextResponse.json(d, { status: s });
+function safeJson(data: any, status = 200) {
+  const body = JSON.stringify(data, (_, v) => (typeof v === "bigint" ? v.toString() : v));
+  return new NextResponse(body, { status, headers: { "content-type": "application/json" } });
+}
+const ok = (d: any, s = 200) => safeJson(d, s);
 const noauth = () => ok({ ok: false, error: "unauthorized" }, 401);
 
+function getCdpNetwork() {
+  const raw = process.env.NETWORK || "base";
+  return raw === "base" ? "base-mainnet" : raw; // base -> base-mainnet
+}
+
+/**
+ * 固定 Owner（CDP_OWNER_EOA_ADDRESS），创建 SA（CREATE2 可预测地址）并尝试部署。
+ * GET /api/admin/init-smart-account?token=ADMIN_TOKEN
+ */
 export async function GET(req: NextRequest) {
   const token = req.headers.get("x-admin-token") ?? new URL(req.url).searchParams.get("token");
   if (token !== process.env.ADMIN_TOKEN) return noauth();
 
-  const ownerAddr = (process.env.CDP_OWNER_EOA_ADDRESS || "").toLowerCase();
-  if (!ownerAddr) return ok({ ok: false, error: "Missing CDP_OWNER_EOA_ADDRESS env" }, 400);
+  const ownerAddress = process.env.CDP_OWNER_EOA_ADDRESS;
+  if (!ownerAddress) return ok({ ok: false, error: "Missing CDP_OWNER_EOA_ADDRESS env" }, 400);
 
-  const network = process.env.NETWORK || "base-sepolia";
+  const network = getCdpNetwork();
 
   try {
     const cdp: any = new CdpClient({
@@ -22,87 +35,46 @@ export async function GET(req: NextRequest) {
       privateKey: process.env.CDP_API_KEY_PRIVATE_KEY!,
     });
 
-    // ① 从 CDP 拉取“账户对象”，而不是用裸地址
-    //    大多数 SDK 版本没有 getAccount(by address) 方法；最稳妥是 list 后匹配
-    const listAccounts =
-      cdp?.evm?.accounts?.list?.bind(cdp.evm.accounts) ?? cdp?.evm?.listAccounts?.bind(cdp.evm);
-    if (!listAccounts) {
-      return ok({ ok: false, error: "SDK missing accounts.list API. Upgrade @coinbase/cdp-sdk." }, 500);
-    }
+    const owner = { address: ownerAddress };
 
-    const all = await listAccounts();
-    const owner = (Array.isArray(all?.accounts) ? all.accounts : all)?.find(
-      (a: any) => a?.address?.toLowerCase() === ownerAddr
-    );
+    // 1) 创建 Smart Account（仅地址，可预测）
+    const smartAccount = await cdp.evm.createSmartAccount({ owner });
 
-    if (!owner) {
-      return ok({
-        ok: false,
-        error:
-          "Owner address not found in this CDP project. The CDP_OWNER_EOA_ADDRESS must be an EOA created under the SAME project.",
-        hint:
-          "Go to Developer Portal → Wallets → EVM EOA，确认该地址存在；或去掉该 env 让代码先创建一个新的 EOA 再重试。",
-      }, 400);
-    }
-
-    // ② 基于“账户对象”创建 Smart Account（只生成 CREATE2 地址）
-    const createSA =
-      cdp?.evm?.createSmartAccount?.bind(cdp.evm) ??
-      cdp?.evm?.smartWallets?.createAccount?.bind(cdp.evm.smartWallets);
-    if (!createSA) {
-      return ok({ ok: false, error: "SDK missing createSmartAccount API. Upgrade @coinbase/cdp-sdk." }, 500);
-    }
-
-    const smartAccount = await createSA({ owner }); // ← 关键：传“账户对象”，不是地址
-
-    // ③ 发送首笔 UO 部署（用 smartAccount 对象）
+    // 2) 试图直接部署：0 ETH 自转（主网需 SA 里有 gas；sepolia 有补贴）
     try {
-      const sendUO =
-        smartAccount?.sendUserOperation?.bind(smartAccount) ??
-        cdp?.evm?.sendUserOperation?.bind(cdp.evm);
-
-      if (!sendUO) {
-        return ok({ ok: false, error: "SDK missing sendUserOperation API." }, 500);
-      }
-
-      const { userOpHash } = await sendUO({
-        smartAccount,          // 传对象，内部会用到 owner.sign()
+      const sendRes = await cdp.evm.sendUserOperation({
+        smartAccount,
         network,
-        calls: [{ to: owner.address as `0x${string}`, value: parseEther("0"), data: "0x" }],
+        calls: [{ to: ownerAddress as `0x${string}`, value: parseEther("0"), data: "0x" }],
       });
-
-      const waitUO =
-        smartAccount?.waitForUserOperation?.bind(smartAccount) ??
-        cdp?.evm?.waitForUserOperation?.bind(cdp.evm);
-
-      const receipt = await waitUO({ userOpHash, smartAccount });
-      const deployed = receipt?.status === "complete";
+      const receipt = await cdp.evm.waitForUserOperation({
+        smartAccount,
+        userOpHash: sendRes.userOpHash,
+      });
 
       return ok({
         ok: true,
+        owner: { address: ownerAddress },
+        smartAccount: { address: smartAccount.address },
+        deployed: receipt?.status === "complete",
+        userOpHash: sendRes.userOpHash,
         network,
-        owner: { address: owner.address, id: owner.id },
-        smartAccount: { address: smartAccount.address, id: smartAccount.id ?? null },
-        deployed,
-        userOpHash,
-        hint: deployed ? "✅ 已部署完成（Smart account 已在 Portal 可见）" : "已提交 UO，稍后再查。",
       });
-    } catch (e: any) {
-      // 主网若没 gas 或未启用赞助，这里会失败
+    } catch (deployErr: any) {
       return ok({
         ok: true,
-        network,
-        owner: { address: owner.address, id: owner.id },
-        smartAccount: { address: smartAccount.address, id: smartAccount.id ?? null },
+        owner: { address: ownerAddress },
+        smartAccount: { address: smartAccount.address },
         deployed: false,
-        userOpError: String(e),
+        userOpError: String(deployErr?.message || deployErr),
         next:
           network === "base-mainnet"
-            ? "请先向 smartAccount.address 转 ≥0.01 Base ETH（或配置 Gas Sponsorship），再调用本接口完成部署。"
-            : "若是 sepolia 仍失败，升级 @coinbase/cdp-sdk 后重试。",
+            ? "请先向 smartAccount.address 充 ≥0.015 Base ETH，再调本接口一次完成部署。"
+            : "sepolia 一般可 0 成本完成部署，若失败请重试。",
+        network,
       });
     }
   } catch (err: any) {
-    return ok({ ok: false, error: String(err) }, 500);
+    return ok({ ok: false, error: String(err), network }, 500);
   }
 }
