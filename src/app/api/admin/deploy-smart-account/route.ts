@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { CdpClient } from "@coinbase/cdp-sdk";
 import { parseEther } from "viem";
 
-// 兼容 BigInt 的 JSON
+// BigInt-safe JSON
 function safeJson(data: any, status = 200) {
   const body = JSON.stringify(data, (_, v) => (typeof v === "bigint" ? v.toString() : v));
   return new NextResponse(body, { status, headers: { "content-type": "application/json" } });
@@ -12,10 +12,10 @@ function safeJson(data: any, status = 200) {
 const ok = (d: any, s = 200) => safeJson(d, s);
 const noauth = () => ok({ ok: false, error: "unauthorized" }, 401);
 
-// 将项目里的 NETWORK（base | base-sepolia）映射为 CDP 的网络名
-function getCdpNetwork() {
-  const raw = process.env.NETWORK || "base";
-  return raw === "base" ? "base-mainnet" : raw; // base -> base-mainnet
+// 仅允许 base / base-sepolia；其余全部改成 base
+function resolveNetwork(input?: string | null) {
+  const n = (input || "").trim().toLowerCase();
+  return n === "base-sepolia" ? "base-sepolia" : "base";
 }
 
 export async function GET(req: NextRequest) {
@@ -29,7 +29,8 @@ export async function GET(req: NextRequest) {
   const ownerAddress = process.env.CDP_OWNER_EOA_ADDRESS;
   if (!ownerAddress) return ok({ ok: false, error: "missing owner (CDP_OWNER_EOA_ADDRESS)" }, 400);
 
-  const network = getCdpNetwork();
+  // 允许用 query 覆盖：?network=base 或 base-sepolia
+  const network = resolveNetwork(url.searchParams.get("network") || process.env.NETWORK || "base");
 
   try {
     const cdp: any = new CdpClient({
@@ -37,13 +38,11 @@ export async function GET(req: NextRequest) {
       privateKey: process.env.CDP_API_KEY_PRIVATE_KEY!,
     });
 
-    // 必须传 smartAccount 对象（含 owner），兼容你的 SDK 分支
     const smartAccount = { address, owner: { address: ownerAddress } };
 
-    // 发一笔 0 ETH 自转来触发部署
     const sendRes = await cdp.evm.sendUserOperation({
       smartAccount,
-      network,
+      network, // <- 只会是 "base" 或 "base-sepolia"
       calls: [{ to: ownerAddress as `0x${string}`, value: parseEther("0"), data: "0x" }],
     });
 
@@ -55,7 +54,7 @@ export async function GET(req: NextRequest) {
     return ok({
       ok: receipt?.status === "complete",
       deployed: receipt?.status === "complete",
-      network, // 已映射后的真实网络名
+      network, // 返回实际使用的网络名
       smartAccount: address,
       owner: ownerAddress,
       userOpHash: sendRes.userOpHash,
