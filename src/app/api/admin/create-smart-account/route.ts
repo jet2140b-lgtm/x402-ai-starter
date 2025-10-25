@@ -7,7 +7,9 @@ const ok = (data: any, status = 200) => NextResponse.json(data, { status });
 const noauth = () => ok({ ok: false, error: "unauthorized" }, 401);
 
 export async function GET(req: NextRequest) {
-  const token = req.headers.get("x-admin-token") ?? new URL(req.url).searchParams.get("token");
+  const token =
+    req.headers.get("x-admin-token") ??
+    new URL(req.url).searchParams.get("token");
   if (token !== process.env.ADMIN_TOKEN) return noauth();
 
   try {
@@ -17,84 +19,98 @@ export async function GET(req: NextRequest) {
     });
 
     const evm: any = (cdp as any).evm;
-    if (!evm) return ok({ ok: false, error: "cdp.evm is undefined. Check @coinbase/cdp-sdk version." }, 500);
+    if (!evm) return ok({ ok: false, error: "cdp.evm is undefined" }, 500);
 
-    // 1) 解析/准备 Owner（必须）
+    // 1) 先准备 Owner（必要）
     let ownerId: string | undefined = process.env.CDP_OWNER_EOA_ID || undefined;
-    let ownerAddress: string | undefined = process.env.CDP_OWNER_EOA_ADDRESS || undefined;
+    let ownerAddress: string | undefined =
+      process.env.CDP_OWNER_EOA_ADDRESS || undefined;
 
-    // 如果只给了 address，尝试找回 id（部分 API 需要 id）
-    if (!ownerId && ownerAddress && evm.accounts?.list) {
-      try {
-        const list = await evm.accounts.list();
-        const hit = list?.find((a: any) => a?.address?.toLowerCase() === ownerAddress!.toLowerCase());
-        if (hit?.id) ownerId = hit.id;
-      } catch {}
-    }
-
-    // 如果一个都没配，先创建一个 EOA 当 Owner
     if (!ownerId && !ownerAddress) {
-      const eoa = await (evm.createAccount ? evm.createAccount() : evm.accounts.create());
-      ownerId = eoa.id;
-      ownerAddress = eoa.address;
+      // 创建一个 EOA 作为 Owner（不同版本有 createAccount / accounts.create）
+      const createEoa =
+        evm.createAccount?.bind(evm) ?? evm.accounts?.create?.bind(evm.accounts);
+      if (!createEoa) {
+        return ok(
+          { ok: false, error: "No EOA creator (evm.createAccount / evm.accounts.create) found." },
+          500
+        );
+      }
+      const eoa = await createEoa();
+      ownerId = eoa?.id;
+      ownerAddress = eoa?.address;
     }
 
-    // 2) 创建 Smart Account（兼容多种 SDK 版本/参数名）
-    let account: any | null = null;
+    // 2) 创建 Smart Account（不同版本方法名不同）
+    const createSmart =
+      evm.smartWallets?.createAccount?.bind(evm.smartWallets) ??
+      evm.createSmartAccount?.bind(evm) ??
+      evm.accounts?.createSmartAccount?.bind(evm.accounts);
 
-    // 新版：evm.smartWallets.createAccount({ ownerAccountId / ownerAddress })
-    if (evm.smartWallets?.createAccount) {
-      try {
-        account = await evm.smartWallets.createAccount(
-          ownerId ? { ownerAccountId: ownerId } : { ownerAddress }
-        );
-      } catch (e) {
-        // 有的版本只接受另一种字段名，换一种再试
-        if (!account) {
-          account = await evm.smartWallets.createAccount(
-            ownerAddress ? { ownerAddress } : { ownerAccountId: ownerId }
-          );
-        }
-      }
-    }
-    // 旧版：evm.createSmartAccount({ ... })
-    else if (evm.createSmartAccount) {
-      try {
-        account = await evm.createSmartAccount(
-          ownerId ? { ownerAccountId: ownerId } : { ownerAddress }
-        );
-      } catch (e) {
-        if (!account) {
-          account = await evm.createSmartAccount(
-            ownerAddress ? { ownerAddress } : { ownerAccountId: ownerId }
-          );
-        }
-      }
-    }
-    // 兜底：某些分支挂在 evm.accounts
-    else if (evm.accounts?.createSmartAccount) {
-      account = await evm.accounts.createSmartAccount(
-        ownerId ? { ownerAccountId: ownerId } : { ownerAddress }
-      );
-    } else {
+    if (!createSmart) {
       return ok(
         {
           ok: false,
           error:
-            "SDK 中未找到创建 Smart Account 的方法。请升级 @coinbase/cdp-sdk 到最新；通常为 evm.smartWallets.createAccount 或 evm.createSmartAccount。",
+            "No Smart Account creator found (evm.smartWallets.createAccount / evm.createSmartAccount / evm.accounts.createSmartAccount). Please upgrade @coinbase/cdp-sdk.",
         },
         500
       );
     }
 
+    const arg =
+      ownerId ? { ownerAccountId: ownerId } : ({ ownerAddress } as any);
+
+    const raw = await createSmart(arg);
+
+    // 3) 解析地址（兼容多种返回结构）
+    const address =
+      raw?.address ??
+      raw?.smartAccount?.address ??
+      raw?.data?.address ??
+      raw?.result?.address ??
+      null;
+    const id =
+      raw?.id ??
+      raw?.smartAccount?.id ??
+      raw?.data?.id ??
+      raw?.result?.id ??
+      null;
+
+    // 4) 如果还是拿不到，尝试列出 Smart Accounts 取最近一个
+    let finalAddress = address;
+    let finalId = id;
+
+    if (!finalAddress) {
+      const listSmart =
+        evm.smartWallets?.listAccounts?.bind(evm.smartWallets) ??
+        evm.listSmartAccounts?.bind(evm) ??
+        evm.accounts?.listSmartAccounts?.bind(evm.accounts);
+
+      if (listSmart) {
+        try {
+          const list = await listSmart();
+          // 取最后一个/第一个
+          const last = Array.isArray(list) ? list[list.length - 1] : null;
+          finalAddress =
+            last?.address ?? last?.smartAccount?.address ?? finalAddress;
+          finalId = last?.id ?? last?.smartAccount?.id ?? finalId;
+        } catch (e) {
+          // 列表失败就忽略
+        }
+      }
+    }
+
+    // 把原始返回也带回去，便于诊断
     return ok({
-      ok: true,
-      type: "smart-account",
-      address: account?.address ?? null,
-      id: account?.id ?? null,
-      ownerAddress,
+      ok: !!finalAddress,
+      address: finalAddress,
+      id: finalId,
       ownerId,
-      hint: "到 Developer Platform → Wallets → EVM Smart account 标签页应能看到该地址。",
+      ownerAddress,
+      raw, // ← 关键：看到 SDK 实际返回结构
+      hint:
+        "若 address 仍为空，请把 raw 结构贴给我；也可升级 @coinbase/cdp-sdk@latest 后再试。",
     });
   } catch (err: any) {
     console.error(err);
