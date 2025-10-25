@@ -3,15 +3,11 @@ export const runtime = "nodejs";
 import { NextRequest, NextResponse } from "next/server";
 import { CdpClient } from "@coinbase/cdp-sdk";
 
-const ok = (data: any, status = 200) =>
-  NextResponse.json(data, { status });
-const noauth = () => ok({ error: "unauthorized" }, 401);
+const ok = (data: any, status = 200) => NextResponse.json(data, { status });
+const noauth = () => ok({ ok: false, error: "unauthorized" }, 401);
 
 export async function GET(req: NextRequest) {
-  // 简单鉴权：header 或 ?token=
-  const token =
-    req.headers.get("x-admin-token") ??
-    new URL(req.url).searchParams.get("token");
+  const token = req.headers.get("x-admin-token") ?? new URL(req.url).searchParams.get("token");
   if (token !== process.env.ADMIN_TOKEN) return noauth();
 
   try {
@@ -21,23 +17,71 @@ export async function GET(req: NextRequest) {
     });
 
     const evm: any = (cdp as any).evm;
+    if (!evm) return ok({ ok: false, error: "cdp.evm is undefined. Check @coinbase/cdp-sdk version." }, 500);
 
+    // 1) 解析/准备 Owner（必须）
+    let ownerId: string | undefined = process.env.CDP_OWNER_EOA_ID || undefined;
+    let ownerAddress: string | undefined = process.env.CDP_OWNER_EOA_ADDRESS || undefined;
+
+    // 如果只给了 address，尝试找回 id（部分 API 需要 id）
+    if (!ownerId && ownerAddress && evm.accounts?.list) {
+      try {
+        const list = await evm.accounts.list();
+        const hit = list?.find((a: any) => a?.address?.toLowerCase() === ownerAddress!.toLowerCase());
+        if (hit?.id) ownerId = hit.id;
+      } catch {}
+    }
+
+    // 如果一个都没配，先创建一个 EOA 当 Owner
+    if (!ownerId && !ownerAddress) {
+      const eoa = await (evm.createAccount ? evm.createAccount() : evm.accounts.create());
+      ownerId = eoa.id;
+      ownerAddress = eoa.address;
+    }
+
+    // 2) 创建 Smart Account（兼容多种 SDK 版本/参数名）
     let account: any | null = null;
 
-    // ✅ 正确的、带“所属对象”的调用方式（保持 this 上下文）
-    if (evm?.smartWallets?.createAccount) {
-      account = await evm.smartWallets.createAccount();
-    } else if (evm?.createSmartAccount) {
-      account = await evm.createSmartAccount();
-    } else if (evm?.accounts?.createSmartAccount) {
-      // 某些旧/新版本可能挂在其他命名空间，做个兜底
-      account = await evm.accounts.createSmartAccount();
+    // 新版：evm.smartWallets.createAccount({ ownerAccountId / ownerAddress })
+    if (evm.smartWallets?.createAccount) {
+      try {
+        account = await evm.smartWallets.createAccount(
+          ownerId ? { ownerAccountId: ownerId } : { ownerAddress }
+        );
+      } catch (e) {
+        // 有的版本只接受另一种字段名，换一种再试
+        if (!account) {
+          account = await evm.smartWallets.createAccount(
+            ownerAddress ? { ownerAddress } : { ownerAccountId: ownerId }
+          );
+        }
+      }
+    }
+    // 旧版：evm.createSmartAccount({ ... })
+    else if (evm.createSmartAccount) {
+      try {
+        account = await evm.createSmartAccount(
+          ownerId ? { ownerAccountId: ownerId } : { ownerAddress }
+        );
+      } catch (e) {
+        if (!account) {
+          account = await evm.createSmartAccount(
+            ownerAddress ? { ownerAddress } : { ownerAccountId: ownerId }
+          );
+        }
+      }
+    }
+    // 兜底：某些分支挂在 evm.accounts
+    else if (evm.accounts?.createSmartAccount) {
+      account = await evm.accounts.createSmartAccount(
+        ownerId ? { ownerAccountId: ownerId } : { ownerAddress }
+      );
     } else {
       return ok(
         {
           ok: false,
           error:
-            "SDK 中未找到创建 Smart Account 的方法。请将 @coinbase/cdp-sdk 升级到最新，或确认 v2 Server Wallet 文档对应的方法名（如 evm.smartWallets.createAccount / evm.createSmartAccount）。",
+            "SDK 中未找到创建 Smart Account 的方法。请升级 @coinbase/cdp-sdk 到最新；通常为 evm.smartWallets.createAccount 或 evm.createSmartAccount。",
         },
         500
       );
@@ -48,8 +92,9 @@ export async function GET(req: NextRequest) {
       type: "smart-account",
       address: account?.address ?? null,
       id: account?.id ?? null,
-      hint:
-        "去 Coinbase Developer Platform → Wallets → EVM Smart account 标签页查看是否出现该地址。",
+      ownerAddress,
+      ownerId,
+      hint: "到 Developer Platform → Wallets → EVM Smart account 标签页应能看到该地址。",
     });
   } catch (err: any) {
     console.error(err);
