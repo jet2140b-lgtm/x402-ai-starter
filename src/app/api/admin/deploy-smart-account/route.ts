@@ -2,7 +2,6 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { CdpClient } from "@coinbase/cdp-sdk";
-import { parseEther } from "viem";
 
 // BigInt-safe JSON
 function safeJson(data: any, status = 200) {
@@ -12,7 +11,7 @@ function safeJson(data: any, status = 200) {
 const ok = (d: any, s = 200) => safeJson(d, s);
 const noauth = () => ok({ ok: false, error: "unauthorized" }, 401);
 
-// 仅允许 base / base-sepolia；其余全部改成 base
+// 只允许 base / base-sepolia，其它一律回退 base
 function resolveNetwork(input?: string | null) {
   const n = (input || "").trim().toLowerCase();
   return n === "base-sepolia" ? "base-sepolia" : "base";
@@ -29,7 +28,6 @@ export async function GET(req: NextRequest) {
   const ownerAddress = process.env.CDP_OWNER_EOA_ADDRESS;
   if (!ownerAddress) return ok({ ok: false, error: "missing owner (CDP_OWNER_EOA_ADDRESS)" }, 400);
 
-  // 允许用 query 覆盖：?network=base 或 base-sepolia
   const network = resolveNetwork(url.searchParams.get("network") || process.env.NETWORK || "base");
 
   try {
@@ -38,28 +36,73 @@ export async function GET(req: NextRequest) {
       privateKey: process.env.CDP_API_KEY_PRIVATE_KEY!,
     });
 
-    const smartAccount = { address, owner: { address: ownerAddress } };
+    // 1) 先创建 smartAccount 对象（带 owner）
+    const smartAccount = { address, owner: { address: ownerAddress } } as any;
 
-    const sendRes = await cdp.evm.sendUserOperation({
-      smartAccount,
-      network, // <- 只会是 "base" 或 "base-sepolia"
-      calls: [{ to: ownerAddress as `0x${string}`, value: parseEther("0"), data: "0x" }],
-    });
+    // 2) 优先使用对象自身的方法（很多版本要求这样）
+    const hasObjSend = typeof smartAccount.sendUserOperation === "function";
+    const hasObjWait = typeof smartAccount.waitForUserOperation === "function";
 
-    const receipt = await cdp.evm.waitForUserOperation({
-      smartAccount,
-      userOpHash: sendRes.userOpHash,
-    });
+    // 3) 准备 calls（全部用字符串，避免 bigint/类型不匹配）
+    const calls = [
+      {
+        to: ownerAddress as `0x${string}`,
+        value: "0",            // ✅ 字符串 "0"，避免 bigint
+        data: "0x",            // ✅ 必须显式 "0x"
+      },
+    ];
+
+    // 为了排错，先返回可见的关键形状
+    const debug = {
+      methodUsed: hasObjSend ? "smartAccount.sendUserOperation" : "cdp.evm.sendUserOperation",
+      network,
+      hasObjWait,
+      callsShape: Array.isArray(calls) ? "array" : typeof calls,
+      callsLen: (calls as any)?.length ?? null,
+    };
+
+    // 4) 发送 UO
+    let userOpHash: string | undefined;
+    if (hasObjSend) {
+      // 某些版本：对象方法只要 { network, calls }
+      const res = await smartAccount.sendUserOperation({ network, calls });
+      userOpHash = res?.userOpHash;
+    } else {
+      // 兜底：走 cdp.evm 版本，但仍传 smartAccount 对象（不是 address）
+      const res = await cdp.evm.sendUserOperation({ smartAccount, network, calls });
+      userOpHash = res?.userOpHash;
+    }
+
+    if (!userOpHash) {
+      return ok({
+        ok: false,
+        smartAccount: address,
+        owner: ownerAddress,
+        network,
+        error: "userOpHash missing after sendUserOperation",
+        debug,
+      });
+    }
+
+    // 5) 等待完成
+    let receipt: any;
+    if (hasObjWait) {
+      receipt = await smartAccount.waitForUserOperation({ userOpHash });
+    } else {
+      receipt = await cdp.evm.waitForUserOperation({ smartAccount, userOpHash });
+    }
 
     return ok({
       ok: receipt?.status === "complete",
       deployed: receipt?.status === "complete",
-      network, // 返回实际使用的网络名
       smartAccount: address,
       owner: ownerAddress,
-      userOpHash: sendRes.userOpHash,
+      network,
+      userOpHash,
+      // debug, // 若还失败可临时打开返回 debug
     });
   } catch (err: any) {
+    // 返回字符串化的错误
     return ok({
       ok: false,
       smartAccount: address,
