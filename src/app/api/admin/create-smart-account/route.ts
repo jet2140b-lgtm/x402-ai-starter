@@ -1,3 +1,4 @@
+// src/app/api/admin/deploy-smart-account/route.ts
 export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
@@ -21,65 +22,41 @@ export async function GET(req: NextRequest) {
   const network = process.env.NETWORK || "base-mainnet";
 
   try {
-    const cdp = new CdpClient({
+    const cdp: any = new CdpClient({
       apiKeyName: process.env.CDP_API_KEY_NAME!,
       privateKey: process.env.CDP_API_KEY_PRIVATE_KEY!,
-    }) as any;
+    });
 
-    // 1) 尝试用 SDK 获取 SmartAccount 对象（某些版本需要对象而不是地址）
-    let sa: any = null;
-    if (cdp?.evm?.getSmartAccount) {
-      // 有的版本需要传 network
-      try {
-        sa = await cdp.evm.getSmartAccount({ address, network });
-      } catch (_) {
-        sa = await cdp.evm.getSmartAccount({ address });
-      }
-    }
+    // 🔧 强制构造一个“SmartAccount 对象”，至少包含 address 字段
+    const sa = { address } as any;
 
-    // 2) 发送 0 ETH 的 UO 触发部署（优先用对象，其次用地址）
-    const sendArgs: any = {
+    // 发一笔 0 ETH 自转，触发部署
+    const sendRes = await cdp.evm.sendUserOperation({
+      smartAccount: sa,               // ✅ 必须传对象（当前 SDK 分支会访问 .address）
       network,
       calls: [{ to: address as `0x${string}`, value: parseEther("0"), data: "0x" }],
-    };
-    if (sa) {
-      sendArgs.smartAccount = sa; // ✅ 某些版本必须是对象
-    } else {
-      sendArgs.smartAccountAddress = address; // 兼容老写法
-    }
+    });
 
-    const sendRes = await cdp.evm.sendUserOperation(sendArgs);
-
-    // 3) 等待完成（同样优先对象，降级地址）
-    const waitArgs: any = { userOpHash: sendRes.userOpHash };
-    if (sa) {
-      waitArgs.smartAccount = sa;
-    } else {
-      waitArgs.smartAccountAddress = address;
-    }
-
-    const receipt = await cdp.evm.waitForUserOperation(waitArgs);
+    const receipt = await cdp.evm.waitForUserOperation({
+      smartAccount: sa,               // ✅ 等待同样传对象
+      userOpHash: sendRes.userOpHash,
+    });
 
     return ok({
       ok: receipt?.status === "complete",
+      deployed: receipt?.status === "complete",
       smartAccount: address,
       userOpHash: sendRes.userOpHash,
-      deployed: receipt?.status === "complete",
-      hint:
-        receipt?.status === "complete"
-          ? "Smart Account 已部署。"
-          : "已提交 UO，稍后再查。",
+      hint: receipt?.status === "complete"
+        ? "Smart Account 已部署。"
+        : "已提交 UO，稍后再查。",
     });
   } catch (err: any) {
-    return ok(
-      {
-        ok: false,
-        smartAccount: address,
-        error: String(err),
-        tip:
-          "如果仍报错，请确保该地址里有 ≥0.01 Base ETH（或开启 Gas Sponsorship），并确认 @coinbase/cdp-sdk 已升级为最新。",
-      },
-      200
-    );
+    return ok({
+      ok: false,
+      smartAccount: address,
+      error: String(err),
+      tip: "已把 smartAccount 强制传对象。如果仍失败，请把完整错误返回给我。",
+    }, 200);
   }
 }
