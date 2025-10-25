@@ -5,7 +5,7 @@ import { env } from "./lib/env";
 import { getOrCreateSellerAccount } from "./lib/accounts";
 
 const network = env.NETWORK;
-const sellerAccount = await getOrCreateSellerAccount();
+const sellerAccount = { address: env.SAFE_TREASURY_ADDRESS as `0x${string}` };
 
 export const x402Middleware = paymentMiddleware(
   sellerAccount.address,
