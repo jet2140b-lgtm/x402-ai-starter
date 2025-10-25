@@ -23,8 +23,8 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Missing payer" }, { status: 400 });
 
   const cdp = new CdpClient({
-    apiKeyName: process.env.CDP_API_KEY_ID!,
-    apiKeySecret: process.env.CDP_API_KEY_SECRET!,
+    apiKeyName: process.env.CDP_API_KEY_NAME!,
+    apiKeySecret: process.env.CDP_API_KEY_PRIVATE_KEY!,
     walletSecret: process.env.CDP_WALLET_SECRET!,
   });
 
