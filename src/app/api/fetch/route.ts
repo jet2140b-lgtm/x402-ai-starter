@@ -30,7 +30,7 @@ export async function GET(req: NextRequest) {
 
   const token = process.env.X404_CONTRACT_ADDRESS!;
   const decimals = Number(process.env.X404_DECIMALS || "18");
-  const amount = parseUnits(process.env.X404_PER_FETCH || "10000", decimals);
+  const amount = parseUnits(process.env.X404_PER_FETCH || "5000", decimals);
 
   await cdp.transfers.sendErc20({
     tokenAddress: token,
@@ -40,7 +40,7 @@ export async function GET(req: NextRequest) {
 
   return NextResponse.json({
     ok: true,
-    sent: process.env.X404_PER_FETCH || "10000",
+    sent: process.env.X404_PER_FETCH || "5000",
     to,
   });
 }
